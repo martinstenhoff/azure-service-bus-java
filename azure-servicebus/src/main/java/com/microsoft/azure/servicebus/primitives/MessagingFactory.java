@@ -243,7 +243,7 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection
 	    if(this.cbsLink == null)
 	    {
 	        this.createCBSLinkAsync();
-	    }	    
+	    }
 	}
 
 	/**
@@ -260,6 +260,7 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection
 		if (!this.factoryOpenFuture.isDone())
 		{		    
 		    AsyncUtil.completeFutureExceptionally(this.factoryOpenFuture, ExceptionUtil.toException(error));
+		    this.setClosed();
 		}
 		else
 		{
@@ -280,6 +281,7 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection
 		if (!this.factoryOpenFuture.isDone())
 		{
 		    AsyncUtil.completeFutureExceptionally(this.factoryOpenFuture, cause);
+		    this.setClosed();
 		}
 		else
 		{
@@ -295,7 +297,7 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection
 			catch (IOException e)
 			{
 			    Marker fatalMarker = MarkerFactory.getMarker(ClientConstants.FATAL_MARKER);
-			    TRACE_LOGGER.error(fatalMarker, "Re-starting reactor failed with exception.", e);							
+			    TRACE_LOGGER.error(fatalMarker, "Re-starting reactor failed with exception.", e);
 				this.onReactorError(cause);
 			}
 			
@@ -309,7 +311,7 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection
 	    TRACE_LOGGER.info("Closing connection to host");
 	    // Important to copy the reference of the connection as a call to getConnection might create a new connection while we are still in this method
 	    Connection currentConnection = this.connection;
-	    if(connection != null)
+	    if(currentConnection != null)
 	    {
 	        Link[] links = this.registeredLinks.toArray(new Link[0]);
 	        
@@ -389,28 +391,29 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection
 	                    });
 	                } catch (IOException e) {
 	                    AsyncUtil.completeFutureExceptionally(this.connetionCloseFuture, e);
-	                }	                
+	                }
+	                
+	                Timer.schedule(new Runnable()
+	                {
+	                    @Override
+	                    public void run()
+	                    {
+	                        if (!MessagingFactory.this.connetionCloseFuture.isDone())
+	                        {
+	                            String errorMessage = "Closing MessagingFactory timed out.";
+	                            TRACE_LOGGER.warn(errorMessage);
+	                            MessagingFactory.this.connetionCloseFuture.completeExceptionally(new TimeoutException(errorMessage));
+	                        }
+	                    }
+	                },
+            this.operationTimeout, TimerType.OneTimeRun);
 	            }
-	            else if(this.connection == null || this.connection.getRemoteState() == EndpointState.CLOSED)
+	            else
 	            {
 	                this.connetionCloseFuture.complete(null);
+	                Timer.unregister(this.getClientId());
 	            }
 		    });
-		    
-		    Timer.schedule(new Runnable()
-            {
-                @Override
-                public void run()
-                {
-                    if (!MessagingFactory.this.connetionCloseFuture.isDone())
-                    {
-                        String errorMessage = "Closing MessagingFactory timed out.";
-                        TRACE_LOGGER.warn(errorMessage);
-                        MessagingFactory.this.connetionCloseFuture.completeExceptionally(new TimeoutException(errorMessage));
-                    }
-                }
-            },
-            this.operationTimeout, TimerType.OneTimeRun);
 			
 			return this.connetionCloseFuture;
 		}
@@ -492,7 +495,10 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection
 	@Override
 	public void registerForConnectionError(Link link)
 	{
-		this.registeredLinks.add(link);
+	    if(link != null)
+	    {
+	        this.registeredLinks.add(link);
+	    }
 	}
 
 	/**
@@ -501,7 +507,10 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection
 	@Override
 	public void deregisterForConnectionError(Link link)
 	{
-		this.registeredLinks.remove(link);
+	    if(link != null)
+	    {
+	        this.registeredLinks.remove(link);
+	    }
 	}
 	
 	void scheduleOnReactorThread(final DispatchHandler handler) throws IOException
@@ -598,7 +607,7 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection
     {
 	    if(++this.cbsLinkCreationAttempts > MAX_CBS_LINK_CREATION_ATTEMPTS )
 	    {
-	        Throwable completionEx = this.lastCBSLinkCreationException == null ? new Exception("CBS link creation failed multiple times.") : this.lastCBSLinkCreationException;	        
+	        Throwable completionEx = this.lastCBSLinkCreationException == null ? new Exception("CBS link creation failed multiple times.") : this.lastCBSLinkCreationException;
 	        this.cbsLinkCreationFuture.completeExceptionally(completionEx);
 	        return CompletableFuture.completedFuture(null);     
 	    }

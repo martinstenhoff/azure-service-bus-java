@@ -3,6 +3,7 @@
 
 package com.microsoft.azure.servicebus;
 
+import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -43,7 +44,8 @@ class MessageReceiver extends InitializableEntity implements IMessageReceiver, I
 
     private final ReceiveMode receiveMode;
     private boolean ownsMessagingFactory;
-    private ConnectionStringBuilder amqpConnectionStringBuilder = null;
+    private URI namespaceEndpointURI;
+    private ClientSettings clientSettings;
     private String entityPath = null;
     private MessagingFactory messagingFactory = null;
     private CoreMessageReceiver internalReceiver = null;
@@ -71,12 +73,13 @@ class MessageReceiver extends InitializableEntity implements IMessageReceiver, I
         this.entityPath = entityPath;
         this.ownsMessagingFactory = ownsMessagingFactory;
     }
-
-    MessageReceiver(ConnectionStringBuilder amqpConnectionStringBuilder, ReceiveMode receiveMode) {
+    
+    MessageReceiver(URI namespaceEndpointURI, String entityPath, ClientSettings clientSettings, ReceiveMode receiveMode) {
         this(receiveMode);
 
-        this.amqpConnectionStringBuilder = amqpConnectionStringBuilder;
-        this.entityPath = this.amqpConnectionStringBuilder.getEntityPath();
+        this.namespaceEndpointURI = namespaceEndpointURI;
+        this.clientSettings = clientSettings;
+        this.entityPath = entityPath;
         this.ownsMessagingFactory = true;
     }
 
@@ -92,13 +95,13 @@ class MessageReceiver extends InitializableEntity implements IMessageReceiver, I
             CompletableFuture<Void> factoryFuture;
             if (this.messagingFactory == null) {
                 if (TRACE_LOGGER.isInfoEnabled()) {
-                    TRACE_LOGGER.info("Creating MessagingFactory from connection string '{}'", this.amqpConnectionStringBuilder.toLoggableString());
+                    TRACE_LOGGER.info("Creating MessagingFactory to namespace '{}'", this.namespaceEndpointURI.toString());
                 }
-                factoryFuture = MessagingFactory.createFromConnectionStringBuilderAsync(amqpConnectionStringBuilder).thenAcceptAsync((f) ->
+                factoryFuture = MessagingFactory.createFromNamespaceEndpointURIAsyc(this.namespaceEndpointURI, this.clientSettings).thenAcceptAsync((f) ->
                 {
                     this.messagingFactory = f;
                     if (TRACE_LOGGER.isInfoEnabled()) {
-                        TRACE_LOGGER.info("Created MessagingFactory from connection string '{}'", this.amqpConnectionStringBuilder.toLoggableString());
+                        TRACE_LOGGER.info("Created MessagingFactory to namespace '{}'", this.namespaceEndpointURI.toString());
                     }
                 });
             } else {
@@ -353,7 +356,7 @@ class MessageReceiver extends InitializableEntity implements IMessageReceiver, I
 
     @Override
     public CompletableFuture<IMessage> receiveAsync(Duration serverWaitTime) {
-        CompletableFuture<IMessage> receiveFuture = this.internalReceiver.receiveAsync(1, serverWaitTime).thenApplyAsync(c ->
+        return this.internalReceiver.receiveAsync(1, serverWaitTime).thenApplyAsync(c ->
         {
             if (c == null)
                 return null;
@@ -362,8 +365,6 @@ class MessageReceiver extends InitializableEntity implements IMessageReceiver, I
             else
                 return MessageConverter.convertAmqpMessageToBrokeredMessage(c.toArray(new MessageWithDeliveryTag[0])[0]);
         });
-        
-        return this.filterLockExpiredMessage(receiveFuture, serverWaitTime);
     }
 
     @Override
@@ -373,7 +374,7 @@ class MessageReceiver extends InitializableEntity implements IMessageReceiver, I
 
     @Override
     public CompletableFuture<Collection<IMessage>> receiveBatchAsync(int maxMessageCount, Duration serverWaitTime) {
-        CompletableFuture<Collection<IMessage>> receiveFuture = this.internalReceiver.receiveAsync(maxMessageCount, serverWaitTime).thenApplyAsync(c ->
+        return this.internalReceiver.receiveAsync(maxMessageCount, serverWaitTime).thenApplyAsync(c ->
         {
             if (c == null)
                 return null;
@@ -382,8 +383,6 @@ class MessageReceiver extends InitializableEntity implements IMessageReceiver, I
             else
                 return convertAmqpMessagesWithDeliveryTagsToBrokeredMessages(c);
         });
-        
-        return this.filterLockExpiredMessages(receiveFuture, maxMessageCount, serverWaitTime);
     }
 
     @Override
@@ -434,7 +433,7 @@ class MessageReceiver extends InitializableEntity implements IMessageReceiver, I
                 }
                 if (MessageReceiver.this.ownsMessagingFactory) {
                     if (TRACE_LOGGER.isInfoEnabled()) {
-                        TRACE_LOGGER.info("Closing MessagingFactory associated with connection string '{}'", this.amqpConnectionStringBuilder.toLoggableString());
+                        TRACE_LOGGER.info("Closing MessagingFactory associated with namespace '{}'", this.namespaceEndpointURI.toString());
                     }
                     return MessageReceiver.this.messagingFactory.closeAsync();
                 } else {
@@ -498,116 +497,6 @@ class MessageReceiver extends InitializableEntity implements IMessageReceiver, I
     private void ensurePeekLockReceiveMode() {
         if (this.receiveMode != ReceiveMode.PEEKLOCK) {
             throw new UnsupportedOperationException("Operations Complete/Abandon/DeadLetter/Defer cannot be called on a receiver opened in ReceiveAndDelete mode.");
-        }
-    }
-    
-    private boolean isMessageLockExpired(IMessage msg)
-    {
-        return msg.getLockedUntilUtc().isBefore(Instant.now());
-    }
-    
-    private CompletableFuture<IMessage> filterLockExpiredMessage(CompletableFuture<IMessage> receivedFuture, Duration serverWaitTime)
-    {
-        if(this.receiveMode == ReceiveMode.RECEIVEANDDELETE)
-        {
-            return receivedFuture;
-        }
-        else
-        {
-            Instant startTime = Instant.now();
-            return receivedFuture.thenCompose((msg) -> {
-                if(msg == null)
-                {
-                    return receivedFuture;
-                }
-                else
-                {
-                    if(isMessageLockExpired(msg))
-                    {
-                        // Message lock already expired. Receive another message
-                        TRACE_LOGGER.warn("Lock of the prefetched message with sequence number '{}' and id '{}' from '{}' already expired", msg.getSequenceNumber(), msg.getMessageId(), this.getEntityPath());
-                        Duration remainingWaitTime = serverWaitTime.minus(Duration.between(startTime, Instant.now()));
-                        if(remainingWaitTime.isNegative() || remainingWaitTime.isZero())
-                        {
-                            return CompletableFuture.completedFuture(null);
-                        }
-                        else
-                        {
-                            TRACE_LOGGER.debug("Ignored the lock exipred message and receiving again from '{}'", this.getEntityPath());
-                            return this.receiveAsync(remainingWaitTime);
-                        }
-                    }
-                    else
-                    {
-                        return CompletableFuture.completedFuture(msg);
-                    }
-                }
-            });
-        }
-    }
-    
-    private CompletableFuture<Collection<IMessage>> filterLockExpiredMessages(CompletableFuture<Collection<IMessage>> receivedFuture, int maxMessageCount, Duration serverWaitTime)
-    {
-        if(this.receiveMode == ReceiveMode.RECEIVEANDDELETE)
-        {
-            return receivedFuture;
-        }
-        else
-        {
-            Instant startTime = Instant.now();
-            return receivedFuture.thenCompose((messages) -> {
-                if(messages == null || messages.size() == 0)
-                {
-                    return receivedFuture;
-                }
-                else
-                {
-                    boolean areMessagesRemoved = false;
-                    Iterator<IMessage> msgIterator = messages.iterator();
-                    while(msgIterator.hasNext())
-                    {
-                        IMessage msg = msgIterator.next();
-                        if(isMessageLockExpired(msg))
-                        {
-                            // Message lock already expired. remove it
-                            TRACE_LOGGER.warn("Lock of the prefetched message with sequence number '{}' and id '{}' from '{}' already expired. Removing it from the list of messages returned to the caller.", msg.getSequenceNumber(), msg.getMessageId(), this.getEntityPath());
-                            msgIterator.remove();
-                            areMessagesRemoved = true;
-                        }
-                        else
-                        {
-                            // Break the loop. As next messages in the list are received from the entity after current message and are definitely not expired. No need to check them
-                            break;
-                        }
-                    }
-                    
-                    if(areMessagesRemoved)
-                    {
-                        if(messages.size() > 0)
-                        {
-                            // There are some messages still in the list.. Just return them to the caller
-                            return CompletableFuture.completedFuture(messages);
-                        }
-                        else
-                        {
-                            Duration remainingWaitTime = serverWaitTime.minus(Duration.between(startTime, Instant.now()));
-                            if(remainingWaitTime.isNegative() || remainingWaitTime.isZero())
-                            {
-                                return CompletableFuture.completedFuture(null);
-                            }
-                            else
-                            {
-                                TRACE_LOGGER.debug("All messages in the received list are lock expired. So receiving again from '{}'", this.getEntityPath());
-                                return this.receiveBatchAsync(maxMessageCount, remainingWaitTime);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        return receivedFuture;
-                    }
-                }
-            });
         }
     }
 

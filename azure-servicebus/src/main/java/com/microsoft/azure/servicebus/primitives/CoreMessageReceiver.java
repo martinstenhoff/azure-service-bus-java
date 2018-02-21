@@ -66,8 +66,8 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 {
 	private static final Logger TRACE_LOGGER = LoggerFactory.getLogger(CoreMessageReceiver.class);
 	private static final Duration LINK_REOPEN_TIMEOUT = Duration.ofMinutes(5); // service closes link long before this timeout expires
-	private static final Duration RETURN_MESSAGES_DAEMON_WAKE_UP_INTERVAL = Duration.ofMillis(100); // Wakes up every 100 milliseconds
-	private static final Duration UPDATE_STATE_REQUESTS_DAEMON_WAKE_UP_INTERVAL = Duration.ofMillis(1000); // Wakes up every second
+	private static final Duration RETURN_MESSAGES_DAEMON_WAKE_UP_INTERVAL = Duration.ofMillis(1); // Wakes up every 1 millisecond
+	private static final Duration UPDATE_STATE_REQUESTS_DAEMON_WAKE_UP_INTERVAL = Duration.ofMillis(500); // Wakes up every 500 milliseconds
 	private static final Duration ZERO_TIMEOUT_APPROXIMATION = Duration.ofMillis(200);
 	private static final int CREDIT_FLOW_BATCH_SIZE = 50;// Arbitrarily chosen 50 to avoid sending too many flows in case prefetch count is large
 	
@@ -98,6 +98,8 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 	private Exception lastKnownLinkError;
 	private Instant lastKnownErrorReportedAt;
 	private final AtomicInteger creditToFlow;
+	private final AtomicInteger creditNeededtoServePendingReceives;
+	private final AtomicInteger currentPrefetechedMessagesCount; // size() on concurrentlinkedqueue is o(n) operation
 	private ScheduledFuture<?> sasTokenRenewTimerFuture;
 	private CompletableFuture<Void> requestResponseLinkCreationFuture;
 	private CompletableFuture<Void> receiveLinkReopenFuture;
@@ -138,13 +140,15 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 		this.lastKnownErrorReportedAt = Instant.now();
 		this.receiveLinkReopenFuture = null;
 		this.creditToFlow = new AtomicInteger();
+		this.creditNeededtoServePendingReceives = new AtomicInteger();
+		this.currentPrefetechedMessagesCount = new AtomicInteger();
 		
 		this.timedOutUpdateStateRequestsDaemon = new Runnable() {
 			@Override
 			public void run() {
 			    try
 			    {
-			        TRACE_LOGGER.debug("Starting '{}' core message receiver's internal loop to complete timed out update state requests.", CoreMessageReceiver.this.receivePath);
+			        TRACE_LOGGER.trace("Starting '{}' core message receiver's internal loop to complete timed out update state requests.", CoreMessageReceiver.this.receivePath);
 			        for(Map.Entry<String, UpdateStateWorkItem> entry : CoreMessageReceiver.this.pendingUpdateStateRequests.entrySet())
 	                {
 	                    Duration remainingTime = entry.getValue().getTimeoutTracker().remaining();
@@ -160,7 +164,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 	                        entry.getValue().getWork().completeExceptionally(exception);
 	                    }
 	                }
-			        TRACE_LOGGER.debug("'{}' core message receiver's internal loop to complete timed out update state requests stopped.", CoreMessageReceiver.this.receivePath);
+			        TRACE_LOGGER.trace("'{}' core message receiver's internal loop to complete timed out update state requests stopped.", CoreMessageReceiver.this.receivePath);
 			    }
 			    catch(Throwable e)
 			    {
@@ -175,7 +179,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
             public void run() {
                 try
                 {
-                    TRACE_LOGGER.debug("Starting '{}' core message receiver's internal loop to return messages to waiting clients.", CoreMessageReceiver.this.receivePath);
+                    TRACE_LOGGER.trace("Starting '{}' core message receiver's internal loop to return messages to waiting clients.", CoreMessageReceiver.this.receivePath);
                     while(!CoreMessageReceiver.this.prefetchedMessages.isEmpty())
                     {
                         ReceiveWorkItem currentReceive = CoreMessageReceiver.this.pendingReceives.poll();
@@ -186,6 +190,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
                                 TRACE_LOGGER.debug("Returning the message received from '{}' to a pending receive request", CoreMessageReceiver.this.receivePath);
                                 currentReceive.cancelTimeoutTask(false);
                                 List<MessageWithDeliveryTag> messages = CoreMessageReceiver.this.receiveCore(currentReceive.getMaxMessageCount());
+                                CoreMessageReceiver.this.reduceCreditForCompletedReceiveRequest(currentReceive.getMaxMessageCount());
                                 AsyncUtil.completeFuture(currentReceive.getWork(), messages);
                             }
                         }
@@ -194,7 +199,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
                             break;
                         }
                     }
-                    TRACE_LOGGER.debug("'{}' core message receiver's internal loop to return messages to waiting clients stopped.", CoreMessageReceiver.this.receivePath);
+                    TRACE_LOGGER.trace("'{}' core message receiver's internal loop to return messages to waiting clients stopped.", CoreMessageReceiver.this.receivePath);
                 }
                 catch(Throwable e)
                 {
@@ -254,7 +259,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 	{
 		this.linkOpen = new WorkItem<CoreMessageReceiver>(new CompletableFuture<CoreMessageReceiver>(), this.operationTimeout);
 		this.scheduleLinkOpenTimeout(this.linkOpen.getTimeoutTracker());
-		this.sendSASTokenAndSetRenewTimer(false).handleAsync((v, sasTokenEx) -> {
+		this.sendTokenAndSetRenewTimer(false).handleAsync((v, sasTokenEx) -> {
             if(sasTokenEx != null)
             {
                 Throwable cause = ExceptionUtil.extractAsyncCompletionCause(sasTokenEx);
@@ -376,19 +381,11 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 
 		final ReceiveLinkHandler handler = new ReceiveLinkHandler(this);
 		BaseHandler.setHandler(receiver, handler);
-		this.underlyingFactory.registerForConnectionError(receiver);
-
 		receiver.open();
-
-		if (this.receiveLink != null)
-		{			
-			this.underlyingFactory.deregisterForConnectionError(this.receiveLink);
-		}
-
 		this.receiveLink = receiver;
 	}
 	
-	CompletableFuture<Void> sendSASTokenAndSetRenewTimer(boolean retryOnFailure)
+	CompletableFuture<Void> sendTokenAndSetRenewTimer(boolean retryOnFailure)
     {
         if(this.getIsClosingOrClosed())
         {
@@ -396,7 +393,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
         }
         else
         {            
-            CompletableFuture<ScheduledFuture<?>> sendTokenFuture = this.underlyingFactory.sendSASTokenAndSetRenewTimer(this.sasTokenAudienceURI, retryOnFailure, () -> this.sendSASTokenAndSetRenewTimer(true));
+            CompletableFuture<ScheduledFuture<?>> sendTokenFuture = this.underlyingFactory.sendSecurityTokenAndSetRenewTimer(this.sasTokenAudienceURI, retryOnFailure, () -> this.sendTokenAndSetRenewTimer(true));
             return sendTokenFuture.thenAccept((f) -> {this.sasTokenRenewTimerFuture = f;TRACE_LOGGER.debug("Sent SAS Token and set renew timer");});
         }
     }
@@ -427,6 +424,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 		int returnedMessageCount = 0;
 		while (currentMessage != null) 
 		{
+		    this.currentPrefetechedMessagesCount.decrementAndGet();
 			if (returnMessages == null)
 			{
 				returnMessages = new LinkedList<MessageWithDeliveryTag>();
@@ -518,6 +516,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 		TRACE_LOGGER.debug("Receiving maximum of '{}' messages from '{}'", maxMessageCount, this.receivePath);
 		CompletableFuture<Collection<MessageWithDeliveryTag>> onReceive = new CompletableFuture<Collection<MessageWithDeliveryTag>>();
 		final ReceiveWorkItem receiveWorkItem = new ReceiveWorkItem(onReceive, timeout, maxMessageCount);
+		this.creditNeededtoServePendingReceives.addAndGet(maxMessageCount);
 		this.pendingReceives.add(receiveWorkItem);
 		// ZERO timeout is special case in SBMP clients where the timeout is sent to the service along with request. It meant 'give me messages you already have, but don't wait'.
 		// As we don't send timeout to service in AMQP, treating this as a special case and using a very short timeout
@@ -533,33 +532,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
                     {
                         if( CoreMessageReceiver.this.pendingReceives.remove(receiveWorkItem))
                         {
-                            // TODO: can we do it better?
-                            // workaround to push the sendflow-performative to reactor
-                            // this sets the receiveLink endpoint to modified state
-                            // (and increment the unsentCredits in proton by 0)
-//                            try
-//                            {
-//                                CoreMessageReceiver.this.underlyingFactory.scheduleOnReactorThread(new DispatchHandler()
-//                                {
-//                                    @Override
-//                                    public void onEvent()
-//                                    {
-//                                        //TODO: not working
-//                                        // Make credit 0, to stop further receiving on this link
-//                                        //MessageReceiver.this.receiveLink.flow(-1 * MessageReceiver.this.receiveLink.getCredit());
-//                                        CoreMessageReceiver.this.receiveLink.flow(0);
-//                                        
-//                                        // See if detach stops
-////                                    MessageReceiver.this.receiveLink.detach();
-////                                    MessageReceiver.this.receiveLink.close();
-////                                    MessageReceiver.this.underlyingFactory.deregisterForConnectionError(MessageReceiver.this.receiveLink);
-//                                    }
-//                                });
-//                            }
-//                            catch (IOException ignore)
-//                            {
-//                            }
-                            
+                            CoreMessageReceiver.this.reduceCreditForCompletedReceiveRequest(receiveWorkItem.getMaxMessageCount());
                             TRACE_LOGGER.warn("No messages received from '{}'. Pending receive request timed out. Returning null to the client.", CoreMessageReceiver.this.receivePath);
                             receiveWorkItem.getWork().complete(null);
                         }
@@ -606,7 +579,9 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 		}
 		
 		if (exception == null)
-		{			
+		{
+		    this.underlyingFactory.registerForConnectionError(this.receiveLink);
+		    
 			if (this.linkOpen != null && !this.linkOpen.getWork().isDone())
 			{
 				AsyncUtil.completeFuture(this.linkOpen.getWork(), this);
@@ -622,24 +597,25 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 			
 			this.underlyingFactory.getRetryPolicy().resetRetryCount(this.underlyingFactory.getClientId());
 
-			this.sendFlow(this.prefetchCount - this.prefetchedMessages.size());
+			this.sendFlow(this.prefetchCount - this.currentPrefetechedMessagesCount.get());
 			
 			TRACE_LOGGER.debug("receiverPath:{}, linkname:{}, updated-link-credit:{}, sentCredits:{}",
                     this.receivePath, this.receiveLink.getName(), this.receiveLink.getCredit(), this.prefetchCount);
 		}
 		else
 		{
-		    TRACE_LOGGER.error("Opening receive link to '{}' failed.", this.receivePath, exception);
             this.cancelSASTokenRenewTimer();
             
 			if (this.linkOpen != null && !this.linkOpen.getWork().isDone())
-			{  
+			{
+			    TRACE_LOGGER.error("Opening receive link to '{}' failed.", this.receivePath, exception);
 				this.setClosed();
 				ExceptionUtil.completeExceptionally(this.linkOpen.getWork(), exception, this, true);
 			}
 			
 			if(this.receiveLinkReopenFuture != null && !this.receiveLinkReopenFuture.isDone())
             {
+			    TRACE_LOGGER.warn("Opening receive link to '{}' failed.", this.receivePath, exception);
 			    AsyncUtil.completeFutureExceptionally(this.receiveLinkReopenFuture, exception);
 			    this.receiveLinkReopenFuture = null;
 			    if(this.isSessionReceiver && (exception instanceof SessionLockLostException || exception instanceof SessionCannotBeLockedException))
@@ -650,7 +626,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
                     this.closeAsync();
                 }
             }
-
+			
 			this.lastKnownLinkError = exception;
 		}
 	}
@@ -681,11 +657,13 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 	                receiveLink.advance();
 	            }
 	            
+	            // Accuracy of count is not that important. So not making those two operations atomic
+                this.currentPrefetechedMessagesCount.incrementAndGet();
 	            this.prefetchedMessages.add(new MessageWithDeliveryTag(message, delivery.getTag()));
 		    }
 		    catch(Exception e)
 		    {
-		        TRACE_LOGGER.error("Reading message from delivery '{}' from '{}', session '{}' failed with unexpected exception.", deliveryTagAsString, this.receivePath, this.sessionId, e);
+		        TRACE_LOGGER.warn("Reading message from delivery '{}' from '{}', session '{}' failed with unexpected exception.", deliveryTagAsString, this.receivePath, this.sessionId, e);
 		        delivery.disposition(Released.getInstance());
                 delivery.settle();
                 return;
@@ -796,6 +774,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 	    if(this.settleModePair.getSenderSettleMode() == SenderSettleMode.UNSETTLED)
 	    {
 	        this.prefetchedMessages.clear();
+	        this.currentPrefetechedMessagesCount.set(0);
 	        this.tagsToDeliveriesMap.clear();
 	    }
 
@@ -807,7 +786,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 		}
 		else
 		{
-		    TRACE_LOGGER.error("Receive link to '{}', sessionId '{}' closed with error.", this.receivePath, this.sessionId, exception);
+		    TRACE_LOGGER.warn("Receive link to '{}', sessionId '{}' closed with error.", this.receivePath, this.sessionId, exception);
 			this.lastKnownLinkError = exception;
 			if ((this.linkOpen != null && !this.linkOpen.getWork().isDone()) ||
 			     (this.receiveLinkReopenFuture !=null && !receiveLinkReopenFuture.isDone()))
@@ -816,6 +795,8 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 			}
 			else
 			{
+			    this.underlyingFactory.deregisterForConnectionError(this.receiveLink);
+			    
 			    if (exception != null &&
 	                    (!(exception instanceof ServiceBusException) || !((ServiceBusException) exception).getIsTransient()))
 	            {
@@ -839,7 +820,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 	                            .getNextRetryInterval(this.getClientId(), exception, workItem.getTimeoutTracker().remaining());
 	                    if (nextRetryInterval != null)
 	                    {
-	                        TRACE_LOGGER.error("Receive link to '{}', sessionId '{}' will be reopened after '{}'", this.receivePath, this.sessionId, nextRetryInterval);
+	                        TRACE_LOGGER.info("Receive link to '{}', sessionId '{}' will be reopened after '{}'", this.receivePath, this.sessionId, nextRetryInterval);
 	                        Timer.schedule(() -> {CoreMessageReceiver.this.ensureLinkIsOpen();}, nextRetryInterval, TimerType.OneTimeRun);
 	                    }
 	                }
@@ -848,30 +829,45 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 		}
 	}
 	
+	private void reduceCreditForCompletedReceiveRequest(int maxCreditCountOfReceiveRequest)
+    {
+        this.creditNeededtoServePendingReceives.updateAndGet((c) -> {
+            int updatedCredit = c - maxCreditCountOfReceiveRequest;
+            return (updatedCredit > 0) ? updatedCredit : 0;
+        });
+    }
+	
 	private void addCredit(ReceiveWorkItem receiveWorkItem)
 	{
-	    int currentTotalCreditToSend = this.creditToFlow.addAndGet(receiveWorkItem.getMaxMessageCount());
-	    if(currentTotalCreditToSend >= this.prefetchCount || currentTotalCreditToSend >= CREDIT_FLOW_BATCH_SIZE)
+	    // Timed out receive requests and batch receive requests completed with less than maxCount messages might have sent more credit
+	    // than consumed by the receiver resulting in excess credit at the service endpoint.
+	    int creditToFlowForWorkItem = this.creditNeededtoServePendingReceives.get() - (this.receiveLink.getCredit() + this.currentPrefetechedMessagesCount.get() + this.creditToFlow.get()) + this.prefetchCount;
+	    if(creditToFlowForWorkItem > 0)
 	    {
-	        try
-            {
-                this.underlyingFactory.scheduleOnReactorThread(new DispatchHandler()
-                {
-                    @Override
-                    public void onEvent()
-                    {
-                        // Send credit accumulated so far to make it less chat-ty
-                        int accumulatedCredit = CoreMessageReceiver.this.creditToFlow.getAndSet(0);
-                        sendFlow(accumulatedCredit);
-                    }
-                });
-            }
-            catch (IOException ioException)
-            {
-                this.pendingReceives.remove(receiveWorkItem);
-                AsyncUtil.completeFutureExceptionally(receiveWorkItem.getWork(), generateDispatacherSchedulingFailedException("completeMessage", ioException));
-                receiveWorkItem.cancelTimeoutTask(false);
-            }
+	        int currentTotalCreditToSend = this.creditToFlow.addAndGet(creditToFlowForWorkItem);
+	        if(currentTotalCreditToSend >= this.prefetchCount || currentTotalCreditToSend >= CREDIT_FLOW_BATCH_SIZE)
+	        {
+	            try
+	            {
+	                this.underlyingFactory.scheduleOnReactorThread(new DispatchHandler()
+	                {
+	                    @Override
+	                    public void onEvent()
+	                    {
+	                        // Send credit accumulated so far to make it less chat-ty
+	                        int accumulatedCredit = CoreMessageReceiver.this.creditToFlow.getAndSet(0);
+	                        sendFlow(accumulatedCredit);
+	                    }
+	                });
+	            }
+	            catch (IOException ioException)
+	            {
+	                this.pendingReceives.remove(receiveWorkItem);
+	                this.reduceCreditForCompletedReceiveRequest(receiveWorkItem.getMaxMessageCount());
+	                AsyncUtil.completeFutureExceptionally(receiveWorkItem.getWork(), generateDispatacherSchedulingFailedException("completeMessage", ioException));
+	                receiveWorkItem.cancelTimeoutTask(false);
+	            }
+	        }
 	    }
 	}
 	
@@ -958,7 +954,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 				referenceId,				 
 						isLinkOpened ? this.prefetchCount : null, 
 								isLinkOpened && this.receiveLink != null ? this.receiveLink.getCredit(): null, 
-										isLinkOpened && this.prefetchedMessages != null ? this.prefetchedMessages.size(): null);
+										this.currentPrefetechedMessagesCount.get());
 
 		return errorContext;
 	}	
@@ -1093,7 +1089,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
         Delivery delivery = CoreMessageReceiver.this.tagsToDeliveriesMap.get(deliveryTagAsString);
         if(delivery == null)
         {
-            TRACE_LOGGER.error("Delivery not found for delivery tag '{}'. Receive link to '{}' closed with a transient error and reopened.", deliveryTagAsString, this.receivePath);
+            TRACE_LOGGER.error("Delivery not found for delivery tag '{}'. Either receive link to '{}' closed with a transient error and reopened or the delivery was already settled by complete/abandon/defer/deadletter.", deliveryTagAsString, this.receivePath);
             AsyncUtil.completeFutureExceptionally(completeMessageFuture, generateDeliveryNotFoundException());
         }
         else
@@ -1150,7 +1146,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 	                    , CoreMessageReceiver.LINK_REOPEN_TIMEOUT
 	                    , TimerType.OneTimeRun);
 	            this.cancelSASTokenRenewTimer();
-	            this.sendSASTokenAndSetRenewTimer(false).handleAsync((v, sendTokenEx) -> {
+	            this.sendTokenAndSetRenewTimer(false).handleAsync((v, sendTokenEx) -> {
 	                if(sendTokenEx != null)
 	                {
 	                    this.receiveLinkReopenFuture.completeExceptionally(sendTokenEx);
@@ -1214,6 +1210,8 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 			pendingRecivesIterator.remove();
 			
 			CompletableFuture<Collection<MessageWithDeliveryTag>> future = workItem.getWork();
+			workItem.cancelTimeoutTask(false);
+			this.reduceCreditForCompletedReceiveRequest(workItem.getMaxMessageCount());
 			if (isTransientException)
 			{				
 				AsyncUtil.completeFuture(future, null);
@@ -1222,8 +1220,6 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 			{
 				ExceptionUtil.completeExceptionally(future, exception, this, true);
 			}
-			
-			workItem.cancelTimeoutTask(false);
 		}
 		
 		for(Map.Entry<String, UpdateStateWorkItem> pendingUpdate : this.pendingUpdateStateRequests.entrySet())
@@ -1258,7 +1254,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 				requestBodyMap.put(ClientConstants.REQUEST_RESPONSE_SESSIONID, this.getSessionId());
 			}
 			
-			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_RENEWLOCK_OPERATION, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout));
+			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_RENEWLOCK_OPERATION, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout), this.receiveLink.getName());
 			CompletableFuture<Message> responseFuture = this.requestResponseLink.requestAysnc(requestMessage, this.operationTimeout);
 			return responseFuture.thenComposeAsync((responseMessage) -> {
 				CompletableFuture<Collection<Instant>> returningFuture = new CompletableFuture<Collection<Instant>>();
@@ -1301,7 +1297,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 				requestBodyMap.put(ClientConstants.REQUEST_RESPONSE_SESSIONID, this.getSessionId());
 			}
 			
-			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_RECEIVE_BY_SEQUENCE_NUMBER, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout));
+			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_RECEIVE_BY_SEQUENCE_NUMBER, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout), this.receiveLink.getName());
 			CompletableFuture<Message> responseFuture = this.requestResponseLink.requestAysnc(requestMessage, this.operationTimeout);
 			return responseFuture.thenComposeAsync((responseMessage) -> {
 				CompletableFuture<Collection<MessageWithLockToken>> returningFuture = new CompletableFuture<Collection<MessageWithLockToken>>();
@@ -1383,7 +1379,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 				requestBodyMap.put(ClientConstants.REQUEST_RESPONSE_SESSIONID, this.getSessionId());
 			}
 			
-			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_UPDATE_DISPOSTION_OPERATION, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout));
+			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_UPDATE_DISPOSTION_OPERATION, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout), this.receiveLink.getName());
 			CompletableFuture<Message> responseFuture = this.requestResponseLink.requestAysnc(requestMessage, this.operationTimeout);
 			return responseFuture.thenComposeAsync((responseMessage) -> {
 				CompletableFuture<Void> returningFuture = new CompletableFuture<Void>();
@@ -1416,7 +1412,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 			HashMap requestBodyMap = new HashMap();
 			requestBodyMap.put(ClientConstants.REQUEST_RESPONSE_SESSIONID, this.getSessionId());
 			
-			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_RENEW_SESSIONLOCK_OPERATION, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout));
+			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_RENEW_SESSIONLOCK_OPERATION, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout), this.receiveLink.getName());
 			CompletableFuture<Message> responseFuture = this.requestResponseLink.requestAysnc(requestMessage, this.operationTimeout);
 			return responseFuture.thenComposeAsync((responseMessage) -> {
 				CompletableFuture<Void> returningFuture = new CompletableFuture<Void>();
@@ -1448,7 +1444,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 			HashMap requestBodyMap = new HashMap();
 			requestBodyMap.put(ClientConstants.REQUEST_RESPONSE_SESSIONID, this.getSessionId());		
 			
-			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_GET_SESSION_STATE_OPERATION, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout));
+			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_GET_SESSION_STATE_OPERATION, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout), this.receiveLink.getName());
 			CompletableFuture<Message> responseFuture = this.requestResponseLink.requestAysnc(requestMessage, this.operationTimeout);
 			return responseFuture.thenComposeAsync((responseMessage) -> {
 				CompletableFuture<byte[]> returningFuture = new CompletableFuture<byte[]>();
@@ -1491,7 +1487,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 			requestBodyMap.put(ClientConstants.REQUEST_RESPONSE_SESSIONID, this.getSessionId());
 			requestBodyMap.put(ClientConstants.REQUEST_RESPONSE_SESSION_STATE, sessionState == null ? null : new Binary(sessionState));
 			
-			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_SET_SESSION_STATE_OPERATION, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout));
+			Message requestMessage = RequestResponseUtils.createRequestMessageFromPropertyBag(ClientConstants.REQUEST_RESPONSE_SET_SESSION_STATE_OPERATION, requestBodyMap, Util.adjustServerTimeout(this.operationTimeout), this.receiveLink.getName());
 			CompletableFuture<Message> responseFuture = this.requestResponseLink.requestAysnc(requestMessage, this.operationTimeout);
 			return responseFuture.thenComposeAsync((responseMessage) -> {
 				CompletableFuture<Void> returningFuture = new CompletableFuture<Void>();
@@ -1518,7 +1514,7 @@ public class CoreMessageReceiver extends ClientEntity implements IAmqpReceiver, 
 	{
 	    this.throwIfInUnusableState();
 		return this.createRequestResponseLinkAsync().thenComposeAsync((v) -> {
-			return CommonRequestResponseOperations.peekMessagesAsync(this.requestResponseLink, this.operationTimeout, fromSequenceNumber, messageCount, sessionId);
+			return CommonRequestResponseOperations.peekMessagesAsync(this.requestResponseLink, this.operationTimeout, fromSequenceNumber, messageCount, sessionId, this.receiveLink.getName());
 		});
 	}	
 }
